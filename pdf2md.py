@@ -8,14 +8,21 @@ import re
 import sys
 import unicodedata
 import warnings
+import zipfile
 from collections import Counter
+from io import BytesIO
 from pathlib import Path
+from xml.etree import ElementTree
 
 import pymupdf
 
 
 class PageRangeError(ValueError):
     """页码范围解析错误。"""
+
+
+class BookmarkError(ValueError):
+    """书签解析错误。"""
 
 
 def parse_page_ranges(spec: str, total: int) -> list[int]:
@@ -216,13 +223,75 @@ def extract_title(markdown: str) -> str | None:
 
 def build_output_name(pdf_stem: str, title: str | None) -> str:
     """根据 PDF 文件名和提取的标题生成输出文件名。"""
-    if title:
-        sanitized = re.sub(r'[\\/:*?"<>|]', '', title).strip()
-        if not sanitized:
-            sanitized = "untitled"
-        sanitized = sanitized[:80]
-        return f"{pdf_stem}_{sanitized}.md"
-    return f"{pdf_stem}_untitled.md"
+    sanitized = sanitize_filename(title) if title else "untitled"
+    return f"{pdf_stem}_{sanitized}.md"
+
+
+def sanitize_filename(name: str) -> str:
+    """清理文件名：去除非法字符，空白替换为下划线，截断到 80 字符。"""
+    sanitized = re.sub(r'[\\/:*?"<>|]', '', name).strip()
+    sanitized = re.sub(r'\s+', '_', sanitized)
+    sanitized = sanitized[:80]
+    return sanitized if sanitized else "untitled"
+
+
+def parse_bookmarks(xml_path: str, total_pages: int, page_offset: int = 1) -> list[tuple[str, int, int]]:
+    """解析 XML 书签文件，返回章节列表 [(name, start_page_0based, end_page_0based), ...]。"""
+    tree = ElementTree.parse(xml_path)
+    root = tree.getroot()
+
+    items = []
+    for item in root.iter("ITEM"):
+        name = item.get("NAME", "").strip()
+        page_str = item.get("PAGE", "")
+        if not page_str:
+            continue
+        try:
+            page = int(page_str)
+        except ValueError:
+            raise BookmarkError(f"无效的页码: {page_str}（章节: {name}）")
+        page += page_offset
+        if page < 1 or page > total_pages:
+            raise BookmarkError(f"页码 {page} 越界，PDF 共 {total_pages} 页（章节: {name}）")
+        items.append((name, page))
+
+    if not items:
+        raise BookmarkError("书签文件中未找到任何 ITEM 条目")
+
+    # 按页码排序
+    items.sort(key=lambda x: x[1])
+
+    # 计算每章的 0-based 页码范围 [start, end]
+    chapters: list[tuple[str, int, int]] = []
+    for i, (name, page) in enumerate(items):
+        start = page - 1  # 转为 0-based
+        if i + 1 < len(items):
+            next_start = items[i + 1][1] - 1  # 下一章起始（0-based）
+            end = max(next_start - 1, start)   # 处理同页书签
+        else:
+            end = total_pages - 1  # 最后一章到 PDF 末尾
+        chapters.append((name, start, end))
+
+    return chapters
+
+
+def batch_convert_to_zip(pdf_path: str, xml_path: str, page_sep: str, page_offset: int = 1) -> bytes:
+    """按书签将 PDF 批量切割为 Markdown 文件，打包为 ZIP 返回 bytes。"""
+    doc = pymupdf.open(pdf_path)
+    total_pages = len(doc)
+    doc.close()
+
+    chapters = parse_bookmarks(xml_path, total_pages, page_offset=page_offset)
+
+    buf = BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        for i, (name, start, end) in enumerate(chapters, 1):
+            page_indices = list(range(start, end + 1))
+            md_text = convert(pdf_path, page_indices, page_sep)
+            filename = f"{i:02d}_{sanitize_filename(name)}.md"
+            zf.writestr(filename, md_text)
+
+    return buf.getvalue()
 
 
 def main():
@@ -230,12 +299,19 @@ def main():
         description="将文字型 PDF 按页转换为 Markdown 文件",
     )
     parser.add_argument("input", help="输入 PDF 文件路径")
-    parser.add_argument("-o", "--output", help="输出 Markdown 路径（默认: 同名.md）")
+    parser.add_argument("-o", "--output", help="输出路径（默认: 同名.md 或 .zip）")
     parser.add_argument("-p", "--pages", help='页码范围，如 "1-5,8,10-12"（默认: 全部）')
+    parser.add_argument("-b", "--bookmarks", help="书签 XML 文件路径，启用按书签批量切割模式")
     parser.add_argument(
         "--page-sep",
         default="<!-- Page {n} -->",
         help="页面分隔符模板，{n} 替换为页码（默认: <!-- Page {n} -->）",
+    )
+    parser.add_argument(
+        "--page-offset",
+        type=int,
+        default=1,
+        help="书签页码偏移量（实际页 = PAGE + offset，默认: 1）",
     )
     args = parser.parse_args()
 
@@ -252,34 +328,67 @@ def main():
         print(f"错误: 无法打开 PDF 文件，文件可能已损坏: {input_path}", file=sys.stderr)
         sys.exit(1)
 
-    page_indices: list[int] = []
-    if args.pages:
-        try:
-            page_indices = parse_page_ranges(args.pages, total_pages)
-        except PageRangeError as e:
-            print(f"错误: {e}", file=sys.stderr)
+    if args.bookmarks:
+        # 书签批量切割模式
+        if args.pages:
+            print("警告: 书签模式下忽略 --pages 参数", file=sys.stderr)
+
+        bookmark_path = Path(args.bookmarks)
+        if not bookmark_path.exists():
+            print(f"错误: 书签文件不存在: {bookmark_path}", file=sys.stderr)
             sys.exit(1)
 
-    try:
-        result = convert(str(input_path), page_indices, args.page_sep)
-    except pymupdf.FileDataError:
-        print(f"错误: PDF 文件读取失败: {input_path}", file=sys.stderr)
-        sys.exit(1)
+        try:
+            zip_bytes = batch_convert_to_zip(str(input_path), str(bookmark_path), args.page_sep, page_offset=args.page_offset)
+        except BookmarkError as e:
+            print(f"错误: {e}", file=sys.stderr)
+            sys.exit(1)
+        except pymupdf.FileDataError:
+            print(f"错误: PDF 文件读取失败: {input_path}", file=sys.stderr)
+            sys.exit(1)
 
-    if args.output:
-        output_path = Path(args.output)
+        if args.output:
+            output_path = Path(args.output)
+        else:
+            output_path = input_path.with_suffix(".zip")
+
+        try:
+            output_path.write_bytes(zip_bytes)
+        except PermissionError:
+            print(f"错误: 无法写入输出文件: {output_path}", file=sys.stderr)
+            sys.exit(1)
+
+        print(f"已按书签切割 -> {output_path}")
     else:
-        title = extract_title(result)
-        output_name = build_output_name(input_path.stem, title)
-        output_path = input_path.parent / output_name
+        # 原有单文件模式
+        page_indices: list[int] = []
+        if args.pages:
+            try:
+                page_indices = parse_page_ranges(args.pages, total_pages)
+            except PageRangeError as e:
+                print(f"错误: {e}", file=sys.stderr)
+                sys.exit(1)
 
-    try:
-        output_path.write_text(result, encoding="utf-8")
-    except PermissionError:
-        print(f"错误: 无法写入输出文件: {output_path}", file=sys.stderr)
-        sys.exit(1)
+        try:
+            result = convert(str(input_path), page_indices, args.page_sep)
+        except pymupdf.FileDataError:
+            print(f"错误: PDF 文件读取失败: {input_path}", file=sys.stderr)
+            sys.exit(1)
 
-    print(f"已转换 {len(page_indices) or total_pages} 页 -> {output_path}")
+        if args.output:
+            output_path = Path(args.output)
+        else:
+            title = extract_title(result)
+            output_name = build_output_name(input_path.stem, title)
+            output_path = input_path.parent / output_name
+
+        try:
+            output_path.write_text(result, encoding="utf-8")
+        except PermissionError:
+            print(f"错误: 无法写入输出文件: {output_path}", file=sys.stderr)
+            sys.exit(1)
+
+        print(f"已转换 {len(page_indices) or total_pages} 页 -> {output_path}")
 
 
 if __name__ == "__main__":
