@@ -7,13 +7,13 @@ from pathlib import Path
 import gradio as gr
 import pymupdf
 
-from pdf2md import PageRangeError, convert, parse_page_ranges
+from pdf2md import PageRangeError, build_output_name, convert, extract_title, parse_page_ranges
 
 
-def process_pdf(file_obj, page_range: str) -> tuple[str, str, str | None]:
+def process_pdf(file_obj, page_range: str, custom_name: str) -> tuple[str, str, str | None, str]:
     """桥接 Gradio 组件与 pdf2md 核心逻辑。
 
-    Returns: (raw_markdown, rendered_markdown, download_file_path)
+    Returns: (raw_markdown, rendered_markdown, download_file_path, output_filename)
     """
     if file_obj is None:
         raise gr.Error("请先上传 PDF 文件")
@@ -42,10 +42,20 @@ def process_pdf(file_obj, page_range: str) -> tuple[str, str, str | None]:
     if caught:
         raise gr.Error(caught[0].message if isinstance(caught[0].message, str) else str(caught[0].message))
 
-    tmp_path = Path(tempfile.gettempdir()) / f"{original_name}.md"
+    title = extract_title(result)
+    auto_name = build_output_name(original_name, title)
+
+    if custom_name and custom_name.strip():
+        final_name = custom_name.strip()
+        if not final_name.endswith(".md"):
+            final_name += ".md"
+    else:
+        final_name = auto_name
+
+    tmp_path = Path(tempfile.gettempdir()) / final_name
     tmp_path.write_text(result, encoding="utf-8")
 
-    return result, result, str(tmp_path)
+    return result, result, str(tmp_path), auto_name
 
 
 def create_ui() -> gr.Blocks:
@@ -59,6 +69,10 @@ def create_ui() -> gr.Blocks:
                 page_range_input = gr.Textbox(
                     label="页码范围（可选）",
                     placeholder='例如: 1-5,8,10-12（留空表示全部页）',
+                )
+                output_name_input = gr.Textbox(
+                    label="输出文件名（可选）",
+                    placeholder="留空自动生成: pdf名_标题.md",
                 )
                 convert_btn = gr.Button("开始转换", variant="primary")
 
@@ -76,8 +90,8 @@ def create_ui() -> gr.Blocks:
 
         convert_btn.click(
             fn=process_pdf,
-            inputs=[file_input, page_range_input],
-            outputs=[raw_output, rendered_output, download_output],
+            inputs=[file_input, page_range_input, output_name_input],
+            outputs=[raw_output, rendered_output, download_output, output_name_input],
         )
 
     return app

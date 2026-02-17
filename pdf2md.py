@@ -4,6 +4,7 @@
 """
 
 import argparse
+import re
 import sys
 import unicodedata
 import warnings
@@ -207,6 +208,23 @@ def convert(
     return "\n\n".join(sections) + "\n"
 
 
+def extract_title(markdown: str) -> str | None:
+    """从 Markdown 文本中提取第一个 h1 标题。"""
+    m = re.search(r'^# (.+)$', markdown, re.MULTILINE)
+    return m.group(1).strip() if m else None
+
+
+def build_output_name(pdf_stem: str, title: str | None) -> str:
+    """根据 PDF 文件名和提取的标题生成输出文件名。"""
+    if title:
+        sanitized = re.sub(r'[\\/:*?"<>|]', '', title).strip()
+        if not sanitized:
+            sanitized = "untitled"
+        sanitized = sanitized[:80]
+        return f"{pdf_stem}_{sanitized}.md"
+    return f"{pdf_stem}_untitled.md"
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="将文字型 PDF 按页转换为 Markdown 文件",
@@ -225,11 +243,6 @@ def main():
     if not input_path.exists():
         print(f"错误: 文件不存在: {input_path}", file=sys.stderr)
         sys.exit(1)
-
-    if args.output:
-        output_path = Path(args.output)
-    else:
-        output_path = input_path.with_suffix(".md")
 
     try:
         doc = pymupdf.open(str(input_path))
@@ -252,6 +265,13 @@ def main():
     except pymupdf.FileDataError:
         print(f"错误: PDF 文件读取失败: {input_path}", file=sys.stderr)
         sys.exit(1)
+
+    if args.output:
+        output_path = Path(args.output)
+    else:
+        title = extract_title(result)
+        output_name = build_output_name(input_path.stem, title)
+        output_path = input_path.parent / output_name
 
     try:
         output_path.write_text(result, encoding="utf-8")
