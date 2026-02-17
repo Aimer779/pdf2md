@@ -10,7 +10,8 @@ import pymupdf
 from pdf2md import (
     PageRangeError, BookmarkError,
     build_output_name, convert, extract_title,
-    parse_page_ranges, batch_convert_to_zip,
+    parse_page_ranges, parse_bookmarks, parse_bookmarks_from_toc,
+    batch_convert_to_zip,
 )
 
 
@@ -66,35 +67,42 @@ def process_pdf_batch(pdf_file_obj, bookmark_file_obj, page_offset_val) -> tuple
     """按书签批量切割 PDF，返回 (状态消息, zip路径)。"""
     if pdf_file_obj is None:
         raise gr.Error("请先上传 PDF 文件")
-    if bookmark_file_obj is None:
-        raise gr.Error("请上传书签 XML 文件")
 
     try:
         page_offset = int(page_offset_val)
     except (TypeError, ValueError):
-        page_offset = 1
+        page_offset = 1 if bookmark_file_obj is not None else 0
 
     pdf_path = pdf_file_obj if isinstance(pdf_file_obj, str) else pdf_file_obj.name
-    xml_path = bookmark_file_obj if isinstance(bookmark_file_obj, str) else bookmark_file_obj.name
     pdf_stem = Path(pdf_path).stem
 
     try:
-        zip_bytes = batch_convert_to_zip(pdf_path, xml_path, "<!-- Page {n} -->", page_offset=page_offset)
+        doc = pymupdf.open(pdf_path)
+        total_pages = len(doc)
+        doc.close()
+    except pymupdf.FileDataError:
+        raise gr.Error("无法打开 PDF 文件，文件可能已损坏")
+
+    try:
+        if bookmark_file_obj is not None:
+            xml_path = bookmark_file_obj if isinstance(bookmark_file_obj, str) else bookmark_file_obj.name
+            chapters = parse_bookmarks(xml_path, total_pages, page_offset=page_offset)
+            source_label = "XML 书签"
+        else:
+            chapters = parse_bookmarks_from_toc(pdf_path, total_pages, page_offset=page_offset)
+            source_label = "PDF 内置书签"
+
+        zip_bytes = batch_convert_to_zip(pdf_path, "<!-- Page {n} -->", chapters)
     except BookmarkError as e:
         raise gr.Error(str(e))
     except pymupdf.FileDataError:
         raise gr.Error("无法打开 PDF 文件，文件可能已损坏")
 
-    # 统计章节数（通过重新解析书签快速获取）
-    from xml.etree import ElementTree
-    tree = ElementTree.parse(xml_path)
-    chapter_count = sum(1 for _ in tree.getroot().iter("ITEM"))
-
     zip_name = f"{pdf_stem}_chapters.zip"
     tmp_path = Path(tempfile.gettempdir()) / zip_name
     tmp_path.write_bytes(zip_bytes)
 
-    return f"已成功切割为 {chapter_count} 个章节", str(tmp_path)
+    return f"已通过{source_label}成功切割为 {len(chapters)} 个章节", str(tmp_path)
 
 
 def create_ui() -> gr.Blocks:
@@ -131,13 +139,14 @@ def create_ui() -> gr.Blocks:
                         download_output = gr.File(label="下载 Markdown 文件")
 
             with gr.TabItem("按书签批量切割"):
+                gr.Markdown("上传书签 XML 按 XML 切割，或留空自动使用 PDF 内置书签。")
                 with gr.Row():
                     with gr.Column(scale=1):
                         bookmark_input = gr.File(
-                            label="上传书签 XML 文件",
+                            label="书签 XML 文件（可选，留空使用 PDF 内置书签）",
                             file_types=[".xml"],
                         )
-                        page_offset_input = gr.Number(label="页码偏移", value=1, precision=0)
+                        page_offset_input = gr.Number(label="页码偏移（XML 默认 1，内置书签默认 0）", value=0, precision=0)
                         batch_btn = gr.Button("批量切割", variant="primary")
 
                     with gr.Column(scale=1):
@@ -151,6 +160,12 @@ def create_ui() -> gr.Blocks:
             fn=process_pdf,
             inputs=[file_input, page_range_input, output_name_input],
             outputs=[raw_output, rendered_output, download_output, output_name_input],
+        )
+
+        bookmark_input.change(
+            fn=lambda f: 1 if f is not None else 0,
+            inputs=[bookmark_input],
+            outputs=[page_offset_input],
         )
 
         batch_btn.click(
